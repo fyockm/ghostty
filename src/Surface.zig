@@ -70,6 +70,7 @@ id: u64,
 
 /// Allocator
 alloc: Allocator,
+home_dir_cache: HomeDirectoryCache = .{},
 
 /// The app that this surface is attached to.
 app: *App,
@@ -841,6 +842,7 @@ pub fn deinit(self: *Surface) void {
     if (self.renderer_state.preedit) |p| self.alloc.free(p.codepoints);
     self.alloc.destroy(self.renderer_state.mutex);
     self.config.deinit();
+    self.home_dir_cache.deinit(self.alloc);
 
     log.info("surface closed id={x}", .{self.id});
 }
@@ -2154,27 +2156,211 @@ pub fn pwd(
     return try alloc.dupe(u8, terminal_pwd);
 }
 
-/// Resolves a relative file path to an absolute path using the terminal's pwd.
+fn resolvePathCandidate(
+    alloc: Allocator,
+    io: std.Io,
+    path: []const u8,
+    terminal_pwd: ?[]const u8,
+    home_dir: ?[]const u8,
+) !?[]const u8 {
+    if (!std.fs.path.isAbsolute(path) and hasExplicitScheme(path)) return null;
+
+    const exact = try normalizePathCandidate(alloc, path, terminal_pwd, home_dir) orelse return null;
+    switch (pathCandidateStatus(io, exact)) {
+        .accessible => return exact,
+        .not_found => alloc.free(exact),
+        .other_error => {
+            alloc.free(exact);
+            return null;
+        },
+    }
+
+    // A final period can belong to the sentence rather than the filename.
+    if (!std.mem.endsWith(u8, path, ".")) return null;
+    const without_period = path[0 .. path.len - 1];
+    const period_candidate = try normalizePathCandidate(
+        alloc,
+        without_period,
+        terminal_pwd,
+        home_dir,
+    ) orelse return null;
+    switch (pathCandidateStatus(io, period_candidate)) {
+        .accessible => return period_candidate,
+        .not_found => alloc.free(period_candidate),
+        .other_error => {
+            alloc.free(period_candidate);
+            return null;
+        },
+    }
+
+    // Trim sentence suffixes from the right, keeping the longest accessible prefix.
+    var prefix_end = without_period.len;
+    while (std.mem.lastIndexOfScalar(u8, without_period[0..prefix_end], ' ')) |space| {
+        prefix_end = space;
+        if (prefix_end == 0) continue;
+
+        const prefix = try normalizePathCandidate(
+            alloc,
+            without_period[0..prefix_end],
+            terminal_pwd,
+            home_dir,
+        ) orelse return null;
+        switch (pathCandidateStatus(io, prefix)) {
+            .accessible => return prefix,
+            .not_found => alloc.free(prefix),
+            .other_error => {
+                alloc.free(prefix);
+                return null;
+            },
+        }
+    }
+
+    return null;
+}
+
+const PathCandidateStatus = enum {
+    accessible,
+    not_found,
+    other_error,
+};
+
+fn pathCandidateStatus(io: std.Io, path: []const u8) PathCandidateStatus {
+    std.Io.Dir.accessAbsolute(io, path, .{}) catch |err| {
+        return if (err == error.FileNotFound) .not_found else .other_error;
+    };
+    return .accessible;
+}
+
+fn normalizePathCandidate(
+    alloc: Allocator,
+    path: []const u8,
+    terminal_pwd: ?[]const u8,
+    home_dir: ?[]const u8,
+) Allocator.Error!?[]const u8 {
+    if (std.fs.path.isAbsolute(path)) {
+        return if (builtin.os.tag == .macos)
+            try std.fs.path.resolve(alloc, &.{path})
+        else
+            try alloc.dupe(u8, path);
+    }
+
+    if (std.mem.startsWith(u8, path, "~/")) {
+        const home = home_dir orelse return null;
+        const suffix = try alloc.dupe(u8, path[2..]);
+        defer alloc.free(suffix);
+        if (builtin.os.tag == .windows) {
+            for (suffix) |*char| {
+                if (char.* == '/') char.* = std.fs.path.sep;
+            }
+        }
+
+        const home_has_separator = home.len > 0 and
+            (home[home.len - 1] == std.fs.path.sep or
+                (builtin.os.tag == .windows and home[home.len - 1] == '/'));
+        const separator: [1]u8 = .{std.fs.path.sep};
+        const expanded = try std.mem.concat(alloc, u8, &.{
+            home,
+            if (home_has_separator) "" else separator[0..],
+            suffix,
+        });
+        defer alloc.free(expanded);
+        return if (builtin.os.tag == .macos)
+            try std.fs.path.resolve(alloc, &.{expanded})
+        else
+            try alloc.dupe(u8, expanded);
+    }
+
+    const terminal_dir = terminal_pwd orelse return null;
+    return try std.fs.path.resolve(alloc, &.{ terminal_dir, path });
+}
+
+fn hasExplicitScheme(path: []const u8) bool {
+    if (path.len == 0 or !std.ascii.isAlphabetic(path[0])) return false;
+
+    for (path[1..]) |char| {
+        switch (char) {
+            ':' => return true,
+            '/', '?', '#' => return false,
+            else => {},
+        }
+        if (!std.ascii.isAlphanumeric(char) and char != '+' and char != '.' and char != '-') {
+            return false;
+        }
+    }
+    return false;
+}
+
+const HomeDirectoryCache = struct {
+    loaded: bool = false,
+    path: ?[]const u8 = null,
+
+    fn get(
+        self: *HomeDirectoryCache,
+        alloc: Allocator,
+        loader: anytype,
+    ) Allocator.Error!?[]const u8 {
+        if (self.loaded) return self.path;
+
+        const path = loader.load(alloc) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                self.loaded = true;
+                return null;
+            },
+        };
+        self.path = path;
+        self.loaded = true;
+        return path;
+    }
+
+    fn deinit(self: *HomeDirectoryCache, alloc: Allocator) void {
+        if (self.path) |path| alloc.free(path);
+    }
+};
+
+const GlobalHomeDirectoryLoader = struct {
+    fn load(_: @This(), alloc: Allocator) anyerror!?[]const u8 {
+        var environ_map = try global.environMap();
+        defer environ_map.deinit();
+
+        var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const home_dir = try internal_os.home(global.io(), &environ_map, &home_buf);
+        return if (home_dir) |path| try alloc.dupe(u8, path) else null;
+    }
+};
+
+/// Resolves a file path to an absolute path using the terminal's pwd or home directory.
 fn resolvePathForOpening(
     self: *Surface,
     path: []const u8,
 ) Allocator.Error!?[]const u8 {
-    if (!std.fs.path.isAbsolute(path)) {
-        const terminal_pwd = self.io.terminal.getPwd() orelse {
-            return null;
-        };
+    const terminal_pwd = if (std.fs.path.isAbsolute(path) or
+        std.mem.startsWith(u8, path, "~/"))
+        null
+    else
+        self.io.terminal.getPwd();
 
-        const resolved = try std.fs.path.resolve(self.alloc, &.{ terminal_pwd, path });
-
-        std.Io.Dir.accessAbsolute(global.io(), resolved, .{}) catch {
-            self.alloc.free(resolved);
-            return null;
-        };
-
-        return resolved;
+    if (std.mem.startsWith(u8, path, "~/")) {
+        const home_dir = try self.home_dir_cache.get(
+            self.alloc,
+            GlobalHomeDirectoryLoader{},
+        );
+        return try resolvePathCandidate(
+            self.alloc,
+            global.io(),
+            path,
+            terminal_pwd,
+            home_dir,
+        );
     }
 
-    return null;
+    return try resolvePathCandidate(
+        self.alloc,
+        global.io(),
+        path,
+        terminal_pwd,
+        null,
+    );
 }
 
 /// Returns the x/y coordinate of where the IME (Input Method Editor)
@@ -6632,6 +6818,293 @@ fn presentSurface(self: *Surface) !void {
 /// not available on a particular platform.
 pub fn getProcessInfo(self: *Surface, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
     return self.io.getProcessInfo(info);
+}
+
+test "home directory cache propagates allocation failures" {
+    const testing = std.testing;
+    const Loader = struct {
+        fn load(_: @This(), _: Allocator) anyerror!?[]const u8 {
+            return error.OutOfMemory;
+        }
+    };
+
+    var cache: HomeDirectoryCache = .{};
+    defer cache.deinit(testing.allocator);
+    try testing.expectError(
+        error.OutOfMemory,
+        cache.get(testing.allocator, Loader{}),
+    );
+}
+
+test "home directory cache loads the home directory once" {
+    const testing = std.testing;
+    var load_count: usize = 0;
+    const Loader = struct {
+        count: *usize,
+
+        fn load(self: @This(), alloc: Allocator) anyerror!?[]const u8 {
+            self.count.* += 1;
+            return try alloc.dupe(u8, "/home/test");
+        }
+    };
+
+    var cache: HomeDirectoryCache = .{};
+    defer cache.deinit(testing.allocator);
+    const loader: Loader = .{ .count = &load_count };
+    const first = (try cache.get(testing.allocator, loader)) orelse
+        return error.TestUnexpectedResult;
+    const second = (try cache.get(testing.allocator, loader)) orelse
+        return error.TestUnexpectedResult;
+
+    try testing.expectEqualStrings("/home/test", first);
+    try testing.expectEqualStrings("/home/test", second);
+    try testing.expectEqual(@as(usize, 1), load_count);
+}
+
+test "path link resolution" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const Case = struct {
+        input: []const u8,
+        files: []const []const u8,
+        home_files: []const []const u8 = &.{},
+        expected_file: ?[]const u8,
+        skip_on_windows: bool = false,
+    };
+    const cases = [_]Case{
+        .{ .input = "./report.md.", .files = &.{ "report.md.", "report.md" }, .expected_file = "report.md.", .skip_on_windows = true },
+        .{ .input = "./report.md.", .files = &.{"report.md"}, .expected_file = "report.md", .skip_on_windows = true },
+        .{ .input = "./SKILL.md again.", .files = &.{"SKILL.md"}, .expected_file = "SKILL.md" },
+        .{ .input = "./guide.md;", .files = &.{"guide.md;"}, .expected_file = "guide.md;" },
+        .{ .input = "./guide.md?", .files = &.{"guide.md?"}, .expected_file = "guide.md?", .skip_on_windows = true },
+        .{ .input = "./guide.md!", .files = &.{"guide.md!"}, .expected_file = "guide.md!" },
+        .{ .input = "~/report.md.", .files = &.{}, .home_files = &.{"report.md."}, .expected_file = "report.md.", .skip_on_windows = true },
+        .{ .input = "~/report.md", .files = &.{}, .home_files = &.{"report.md"}, .expected_file = "report.md" },
+        .{ .input = "./missing.md.", .files = &.{}, .expected_file = null },
+        .{ .input = "https://example.com", .files = &.{}, .expected_file = null },
+    };
+
+    for (cases) |case| {
+        if (builtin.os.tag == .windows and case.skip_on_windows) continue;
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var home = testing.tmpDir(.{});
+        defer home.cleanup();
+
+        for (case.files) |name| {
+            var file = try tmp.dir.createFile(testing.io, name, .{});
+            file.close(testing.io);
+        }
+        for (case.home_files) |name| {
+            var file = try home.dir.createFile(testing.io, name, .{});
+            file.close(testing.io);
+        }
+        var anchor = try tmp.dir.createFile(testing.io, "anchor", .{});
+        anchor.close(testing.io);
+        var home_anchor = try home.dir.createFile(testing.io, "anchor", .{});
+        home_anchor.close(testing.io);
+
+        const anchor_path = try tmp.dir.realPathFileAlloc(testing.io, "anchor", alloc);
+        defer alloc.free(anchor_path);
+        const terminal_pwd = std.fs.path.dirname(anchor_path).?;
+        const home_anchor_path = try home.dir.realPathFileAlloc(testing.io, "anchor", alloc);
+        defer alloc.free(home_anchor_path);
+        const home_dir = std.fs.path.dirname(home_anchor_path).?;
+        if (case.home_files.len > 0) {
+            try testing.expect(!std.mem.eql(u8, terminal_pwd, home_dir));
+        }
+
+        if (case.expected_file) |expected_file| {
+            const expected_path = if (case.home_files.len > 0)
+                try home.dir.realPathFileAlloc(testing.io, expected_file, alloc)
+            else
+                try tmp.dir.realPathFileAlloc(testing.io, expected_file, alloc);
+            defer alloc.free(expected_path);
+            const resolved = try resolvePathCandidate(
+                alloc,
+                testing.io,
+                case.input,
+                terminal_pwd,
+                home_dir,
+            );
+            if (resolved) |path| {
+                defer alloc.free(path);
+                if (!std.mem.eql(u8, expected_path, path)) {
+                    std.debug.print(
+                        "path link resolution for '{s}': expected {s}, got {s}\n",
+                        .{ case.input, expected_path, path },
+                    );
+                }
+                try testing.expectEqualStrings(expected_path, path);
+            } else {
+                std.debug.print(
+                    "path link resolution for '{s}': expected {s}, got null\n",
+                    .{ case.input, expected_path },
+                );
+                try testing.expect(false);
+            }
+        } else {
+            const resolved = try resolvePathCandidate(
+                alloc,
+                testing.io,
+                case.input,
+                terminal_pwd,
+                home_dir,
+            );
+            if (resolved) |path| {
+                std.debug.print(
+                    "path link resolution for '{s}': expected null, got {s}\n",
+                    .{ case.input, path },
+                );
+                alloc.free(path);
+            }
+            try testing.expect(resolved == null);
+        }
+    }
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const absolute_filename = if (builtin.os.tag == .windows) "report.md" else "report.md.";
+    var file = try tmp.dir.createFile(testing.io, absolute_filename, .{});
+    file.close(testing.io);
+    var anchor = try tmp.dir.createFile(testing.io, "anchor", .{});
+    anchor.close(testing.io);
+
+    const anchor_path = try tmp.dir.realPathFileAlloc(testing.io, "anchor", alloc);
+    defer alloc.free(anchor_path);
+    const terminal_pwd = std.fs.path.dirname(anchor_path).?;
+    const absolute_path = try tmp.dir.realPathFileAlloc(testing.io, absolute_filename, alloc);
+    defer alloc.free(absolute_path);
+    const resolved = try resolvePathCandidate(
+        alloc,
+        testing.io,
+        absolute_path,
+        terminal_pwd,
+        terminal_pwd,
+    );
+    if (resolved) |path| {
+        defer alloc.free(path);
+        if (!std.mem.eql(u8, absolute_path, path)) {
+            std.debug.print(
+                "path link resolution for absolute path '{s}': got {s}\n",
+                .{ absolute_path, path },
+            );
+        }
+        try testing.expectEqualStrings(absolute_path, path);
+    } else {
+        std.debug.print(
+            "path link resolution for absolute path '{s}': got null\n",
+            .{absolute_path},
+        );
+        try testing.expect(false);
+    }
+}
+
+test "path link resolution allows colons after a relative directory" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(testing.io, "src", .default_dir);
+
+    var file = try tmp.dir.createFile(testing.io, "src/file:line.md.", .{});
+    file.close(testing.io);
+    var anchor = try tmp.dir.createFile(testing.io, "anchor", .{});
+    anchor.close(testing.io);
+
+    const anchor_path = try tmp.dir.realPathFileAlloc(testing.io, "anchor", alloc);
+    defer alloc.free(anchor_path);
+    const terminal_pwd = std.fs.path.dirname(anchor_path).?;
+    const expected_path = try tmp.dir.realPathFileAlloc(
+        testing.io,
+        "src/file:line.md.",
+        alloc,
+    );
+    defer alloc.free(expected_path);
+
+    const resolved = try resolvePathCandidate(
+        alloc,
+        testing.io,
+        "src/file:line.md.",
+        terminal_pwd,
+        null,
+    );
+    if (resolved) |path| {
+        defer alloc.free(path);
+        try testing.expectEqualStrings(expected_path, path);
+    } else {
+        try testing.expect(false);
+    }
+}
+
+test "path link resolution preserves non-macOS symlink traversal" {
+    switch (builtin.os.tag) {
+        .linux, .freebsd => {},
+        else => return error.SkipZigTest,
+    }
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(testing.io, "src", .default_dir);
+    try tmp.dir.createDir(testing.io, "target", .default_dir);
+    try tmp.dir.createDir(testing.io, "target/sub", .default_dir);
+    try tmp.dir.symLink(testing.io, "../target/sub", "src/link", .{});
+
+    var target_file = try tmp.dir.createFile(testing.io, "target/file.md.", .{});
+    target_file.close(testing.io);
+    var lexical_file = try tmp.dir.createFile(testing.io, "src/file.md.", .{});
+    lexical_file.close(testing.io);
+    var anchor = try tmp.dir.createFile(testing.io, "anchor", .{});
+    anchor.close(testing.io);
+
+    const anchor_path = try tmp.dir.realPathFileAlloc(testing.io, "anchor", alloc);
+    defer alloc.free(anchor_path);
+    const terminal_pwd = std.fs.path.dirname(anchor_path).?;
+    const absolute_path = try std.mem.concat(
+        alloc,
+        u8,
+        &.{ terminal_pwd, "/src/link/../file.md." },
+    );
+    defer alloc.free(absolute_path);
+
+    const symlink_target = try tmp.dir.realPathFileAlloc(
+        testing.io,
+        "target/file.md.",
+        alloc,
+    );
+    defer alloc.free(symlink_target);
+    const lexical_target = try tmp.dir.realPathFileAlloc(
+        testing.io,
+        "src/file.md.",
+        alloc,
+    );
+    defer alloc.free(lexical_target);
+    const traversed_target = try tmp.dir.realPathFileAlloc(
+        testing.io,
+        "src/link/../file.md.",
+        alloc,
+    );
+    defer alloc.free(traversed_target);
+    try testing.expect(!std.mem.eql(u8, symlink_target, lexical_target));
+    try testing.expectEqualStrings(symlink_target, traversed_target);
+
+    const resolved = try resolvePathCandidate(
+        alloc,
+        testing.io,
+        absolute_path,
+        null,
+        null,
+    );
+    if (resolved) |path| {
+        defer alloc.free(path);
+        try testing.expectEqualStrings(absolute_path, path);
+    } else {
+        try testing.expect(false);
+    }
 }
 
 test "queueIo frees allocated writes in readonly mode" {
